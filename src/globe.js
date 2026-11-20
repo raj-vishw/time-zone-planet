@@ -397,13 +397,41 @@ function makeStars() {
   return new THREE.Points(g, m);
 }
 
-// Clouds: a smooth shell just above the lowlands (high plateaus poke through, as they do). Cover is worked out per
-// pixel, so edges are soft and wispy rather than triangle-shaped. It follows the real climate bands: a cloudy belt
-// near the equator, clear subtropics (the big deserts), stormy mid-latitudes. Features are squashed north-south so
-// they stretch along the winds, gently warped so they curl, and drift slowly east while they change shape.
+// Clouds: a shell just above the lowlands (high plateaus poke through, as they do). Cover is worked out per pixel, so
+// edges are soft and wispy rather than triangle-shaped. It follows the real climate bands: a cloudy belt near the
+// equator, clear subtropics (the big deserts), stormy mid-latitudes. Features are squashed north-south so they
+// stretch along the winds, gently warped so they curl, and drift slowly east while they change shape.
+// A hint of facets: the shell is faceted like the ground (same face size), and each facet gets a slightly tilted
+// normal and a small brightness offset, so triangles show faintly inside the clouds, most of all near the day/night line.
+const CLOUD_TILT = 0.17, CLOUD_JITTER = 0.04;
 function makeClouds(uniforms, lowDetail) {
   const R = 1.026;
-  const g = new THREE.SphereGeometry(R, 160, 112);
+  const { positions: P, faces: F } = icosphere(48);
+  const nf = F.length / 3;
+  const pos = new Float32Array(nf * 9), facet = new Float32Array(nf * 12);
+  for (let f = 0; f < nf; f++) {
+    let cx = 0, cy = 0, cz = 0;
+    for (let k = 0; k < 3; k++) { const v = F[f * 3 + k]; cx += P[v * 3]; cy += P[v * 3 + 1]; cz += P[v * 3 + 2]; }
+    const l = Math.hypot(cx, cy, cz);
+    cx /= l; cy /= l; cz /= l;
+    // Random tilt, kept tangent to the sphere so it changes the shading but not which way the facet faces overall.
+    let tx = hash01(f * 3 + 11) - 0.5, ty = hash01(f * 3 + 12) - 0.5, tz = hash01(f * 3 + 13) - 0.5;
+    const d = tx * cx + ty * cy + tz * cz;
+    tx -= d * cx; ty -= d * cy; tz -= d * cz;
+    const tl = Math.hypot(tx, ty, tz) || 1;
+    let nx = cx + (tx / tl) * CLOUD_TILT, ny = cy + (ty / tl) * CLOUD_TILT, nz = cz + (tz / tl) * CLOUD_TILT;
+    const nl = Math.hypot(nx, ny, nz);
+    nx /= nl; ny /= nl; nz /= nl;
+    const jit = (hash01(f + 7331) - 0.5) * 2 * CLOUD_JITTER;
+    for (let k = 0; k < 3; k++) {
+      const v = F[f * 3 + k];
+      pos.set([P[v * 3] * R, P[v * 3 + 1] * R, P[v * 3 + 2] * R], f * 9 + k * 3);
+      facet.set([nx, ny, nz, jit], f * 12 + k * 4);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('aFacet', new THREE.BufferAttribute(facet, 4)); // tilted facet normal, brightness offset
   const m = new THREE.ShaderMaterial({
     uniforms,
     // Phones: 3 noise octaves instead of 5 and no light-and-shade pass, roughly half the per-pixel cost.
@@ -411,14 +439,15 @@ function makeClouds(uniforms, lowDetail) {
     transparent: true,
     depthWrite: false,
     vertexShader: /* glsl */ `
-      varying vec3 vP;
+      attribute vec4 aFacet;
+      varying vec3 vP; varying vec4 vFacet;
       void main() {
-        vP = position;
+        vP = position; vFacet = aFacet;
         gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
       }`,
     fragmentShader: /* glsl */ `
       uniform vec3 uSun; uniform float uTime;
-      varying vec3 vP;
+      varying vec3 vP; varying vec4 vFacet;
       ${DAWN_GLSL}
       float hash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
       float noise(vec3 x) {
@@ -457,7 +486,8 @@ function makeClouds(uniforms, lowDetail) {
         if (body < 0.004) discard;
         float s, morning; dawnInfo(p, uSun, s, morning);
         float day = smoothstep(-0.12, 0.1, s);
-        float diff = clamp(dot(p, uSun) * 0.9 + 0.1, 0.0, 1.0);
+        // Lit by the facet's tilted normal (constant across the triangle), not the smooth sphere: the hint of facets.
+        float diff = clamp(dot(normalize(vFacet.xyz), uSun) * 0.9 + 0.1, 0.0, 1.0) * (1.0 + vFacet.w);
         // Light and shade: compare with the cloud a little toward the sun. Sun-facing edges are bright, the far sides
         // of thick clouds fall into their own shadow.
       #ifdef CLOUD_LOW
