@@ -21,7 +21,7 @@ const DAWN_GLSL = /* glsl */ `
   }
 `;
 
-/** opts.lowDetail: cheaper clouds (touch devices). */
+/** opts.renderer: needed to bake the cloud map. opts.lowDetail: a smaller cloud map (touch devices). */
 export async function createGlobe(scene, landUrl, opts = {}) {
   const data = await (await fetch(landUrl)).json();
   const heights = base64ToBytes(data.heights);
@@ -198,7 +198,7 @@ export async function createGlobe(scene, landUrl, opts = {}) {
 
   // --- Clouds: a faceted shell just above the lowlands (high plateaus poke through, as they do) ---
   const clouds = makeClouds(uniforms, !!opts.lowDetail);
-  scene.add(clouds);
+  scene.add(clouds.mesh);
 
   // --- Atmosphere halo: the inside of a slightly bigger sphere, bright at the limb ---
   const atmoMat = new THREE.ShaderMaterial({
@@ -276,6 +276,7 @@ export async function createGlobe(scene, landUrl, opts = {}) {
     update(sunVec, time, ms, camera) {
       uniforms.uSun.value.set(sunVec[0], sunVec[1], sunVec[2]);
       uniforms.uTime.value = time;
+      if (opts.renderer) clouds.bake(opts.renderer);
       curtain.quaternion.setFromUnitVectors(X_AXIS, uniforms.uSun.value);
       sun.position.copy(uniforms.uSun.value).multiplyScalar(60);
       ring.update(ms, uniforms.uSun.value, camera);
@@ -397,15 +398,82 @@ function makeStars() {
   return new THREE.Points(g, m);
 }
 
-// Clouds: a shell just above the lowlands (high plateaus poke through, as they do). Cover is worked out per pixel, so
-// edges are soft and wispy rather than triangle-shaped. It follows the real climate bands: a cloudy belt near the
-// equator, clear subtropics (the big deserts), stormy mid-latitudes. Features are squashed north-south so they
-// stretch along the winds, gently warped so they curl, and drift slowly east while they change shape.
+// Clouds: a shell just above the lowlands (high plateaus poke through, as they do). Cover follows the real climate
+// bands: a cloudy belt near the equator, clear subtropics (the big deserts), stormy mid-latitudes. Features are squashed
+// north-south so they stretch along the winds, gently warped so they curl, and drift slowly east while they change shape.
+// Cost: the noise is expensive, so it isn't run per screen pixel. It's baked into an equirectangular cover map, a
+// sixteenth of the rows per frame (a full refresh every ~1/4 s), and the shell just reads that map. The clouds move far
+// too slowly for the delay to show, and scrubbing time doesn't touch them (they drift with real time).
 // A hint of facets: the shell is faceted like the ground (same face size), and each facet gets a slightly tilted
 // normal and a small brightness offset, so triangles show faintly inside the clouds, most of all near the day/night line.
 const CLOUD_TILT = 0.17, CLOUD_JITTER = 0.04;
+const CLOUD_SLICES = 16;
 function makeClouds(uniforms, lowDetail) {
   const R = 1.026;
+
+  // --- the cover map: R = how much cloud, 0..1 ---
+  const W = lowDetail ? 1024 : 2048, H = W / 2;
+  const target = new THREE.WebGLRenderTarget(W, H, {
+    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false, depthBuffer: false,
+  });
+  target.texture.wrapS = THREE.RepeatWrapping; // seamless across the date line
+  const genScene = new THREE.Scene(), genCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  genScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.ShaderMaterial({
+    uniforms,
+    depthTest: false,
+    depthWrite: false,
+    vertexShader: /* glsl */ `
+      varying vec2 vUv;
+      void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+    fragmentShader: /* glsl */ `
+      uniform float uTime;
+      varying vec2 vUv;
+      float hash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+      float noise(vec3 x) {
+        vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+        return mix(mix(mix(hash(i), hash(i + vec3(1, 0, 0)), f.x), mix(hash(i + vec3(0, 1, 0)), hash(i + vec3(1, 1, 0)), f.x), f.y),
+                   mix(mix(hash(i + vec3(0, 0, 1)), hash(i + vec3(1, 0, 1)), f.x), mix(hash(i + vec3(0, 1, 1)), hash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+      }
+      float fbm(vec3 p) { float a = 0.5, s = 0.0; for (int i = 0; i < 5; i++) { s += a * noise(p); p = p * 2.07 + vec3(1.7, 9.2, 3.1); a *= 0.5; } return s; }
+      void main() {
+        // Texel to direction on the sphere (lon 0 at +Z, east toward +X, the same convention as everything else).
+        float lon = (vUv.x - 0.5) * 6.2831853, lat = (vUv.y - 0.5) * 3.1415927;
+        vec3 c = vec3(cos(lat) * sin(lon), sin(lat), cos(lat) * cos(lon));
+        float latD = lat * 57.29578, al = abs(latD);
+        float a = uTime * 0.004; // slow eastward drift
+        vec3 q = vec3(c.x * cos(a) - c.z * sin(a), c.y, c.x * sin(a) + c.z * cos(a));
+        vec3 sp = vec3(q.x * 4.2, q.y * 8.0, q.z * 4.2) + vec3(0.0, 0.0, uTime * 0.006);
+        // Warp the lookup by a coarse noise so shapes curl and streak instead of forming round blobs.
+        sp += (vec3(noise(sp * 0.7 + 3.1), noise(sp * 0.7 + 7.7), noise(sp * 0.7 + 1.3)) - 0.5) * 0.9;
+        float n = fbm(sp);
+        // Threshold on the noise: lower = more cloud. fbm is ~0.47 +- 0.1, so 0.5 is ~40% cover, 0.57 ~15%.
+        float t = 0.55
+          - 0.045 * exp(-pow(latD / 9.0, 2.0))          // tropical rain belt
+          + 0.05 * exp(-pow((al - 23.0) / 8.0, 2.0))    // dry subtropics
+          - 0.06 * exp(-pow((al - 55.0) / 11.0, 2.0))   // mid-latitude storm tracks
+          + 0.05 * smoothstep(70.0, 88.0, al);          // dry polar air
+        gl_FragColor = vec4(smoothstep(t - 0.015, t + 0.11, n), 0.0, 0.0, 1.0);
+      }`,
+  })));
+  let slice = -1; // -1: nothing baked yet, so bake the whole map on the first frame
+
+  function bake(renderer) {
+    const prev = renderer.getRenderTarget();
+    if (slice < 0) {
+      target.scissorTest = false;
+      slice = 0;
+    } else {
+      const rows = H / CLOUD_SLICES;
+      target.scissor.set(0, slice * rows, W, rows);
+      target.scissorTest = true;
+      slice = (slice + 1) % CLOUD_SLICES;
+    }
+    renderer.setRenderTarget(target);
+    renderer.render(genScene, genCam);
+    renderer.setRenderTarget(prev);
+  }
+
+  // --- the faceted shell that reads the map ---
   const { positions: P, faces: F } = icosphere(48);
   const nf = F.length / 3;
   const pos = new Float32Array(nf * 9), facet = new Float32Array(nf * 12);
@@ -433,9 +501,7 @@ function makeClouds(uniforms, lowDetail) {
   g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   g.setAttribute('aFacet', new THREE.BufferAttribute(facet, 4)); // tilted facet normal, brightness offset
   const m = new THREE.ShaderMaterial({
-    uniforms,
-    // Phones: 3 noise octaves instead of 5 and no light-and-shade pass, roughly half the per-pixel cost.
-    defines: lowDetail ? { CLOUD_LOW: '' } : {},
+    uniforms: { ...uniforms, uCloudMap: { value: target.texture } },
     transparent: true,
     depthWrite: false,
     vertexShader: /* glsl */ `
@@ -446,43 +512,15 @@ function makeClouds(uniforms, lowDetail) {
         gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
       }`,
     fragmentShader: /* glsl */ `
-      uniform vec3 uSun; uniform float uTime;
+      uniform vec3 uSun; uniform sampler2D uCloudMap;
       varying vec3 vP; varying vec4 vFacet;
       ${DAWN_GLSL}
-      float hash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
-      float noise(vec3 x) {
-        vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
-        return mix(mix(mix(hash(i), hash(i + vec3(1, 0, 0)), f.x), mix(hash(i + vec3(0, 1, 0)), hash(i + vec3(1, 1, 0)), f.x), f.y),
-                   mix(mix(hash(i + vec3(0, 0, 1)), hash(i + vec3(1, 0, 1)), f.x), mix(hash(i + vec3(0, 1, 1)), hash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+      float cloudAt(vec3 p) {
+        return texture2D(uCloudMap, vec2(atan(p.x, p.z) * 0.1591549 + 0.5, asin(clamp(p.y, -1.0, 1.0)) * 0.3183099 + 0.5)).r;
       }
-      float fbm5(vec3 p) { float a = 0.5, s = 0.0; for (int i = 0; i < 5; i++) { s += a * noise(p); p = p * 2.07 + vec3(1.7, 9.2, 3.1); a *= 0.5; } return s; }
-      float fbm3(vec3 p) { float a = 0.5, s = 0.0; for (int i = 0; i < 3; i++) { s += a * noise(p); p = p * 2.07 + vec3(1.7, 9.2, 3.1); a *= 0.5; } return s + 0.047; } // + the octaves it skips, on average
-
-      // How much cloud at unit vector c: 0 clear .. 1 thick. 'detail' picks the full or the cheap noise.
-      float cloudAt(vec3 c, bool detail) {
-        float lat = asin(clamp(c.y, -1.0, 1.0)) * 57.29578, al = abs(lat);
-        float a = uTime * 0.004; // slow eastward drift
-        vec3 q = vec3(c.x * cos(a) - c.z * sin(a), c.y, c.x * sin(a) + c.z * cos(a));
-        vec3 sp = vec3(q.x * 4.2, q.y * 8.0, q.z * 4.2) + vec3(0.0, 0.0, uTime * 0.006);
-        // Warp the lookup by a coarse noise so shapes curl and streak instead of forming round blobs.
-        sp += (vec3(noise(sp * 0.7 + 3.1), noise(sp * 0.7 + 7.7), noise(sp * 0.7 + 1.3)) - 0.5) * 0.9;
-      #ifdef CLOUD_LOW
-        float n = fbm3(sp);
-      #else
-        float n = detail ? fbm5(sp) : fbm3(sp);
-      #endif
-        // Threshold on the noise: lower = more cloud. fbm is ~0.47 ± 0.1, so 0.5 ≈ 40% cover, 0.57 ≈ 15%.
-        float t = 0.55
-          - 0.045 * exp(-pow(lat / 9.0, 2.0))           // tropical rain belt
-          + 0.05 * exp(-pow((al - 23.0) / 8.0, 2.0))    // dry subtropics
-          - 0.06 * exp(-pow((al - 55.0) / 11.0, 2.0))   // mid-latitude storm tracks
-          + 0.05 * smoothstep(70.0, 88.0, al);          // dry polar air
-        return smoothstep(t - 0.015, t + 0.11, n);
-      }
-
       void main() {
         vec3 p = normalize(vP);
-        float body = cloudAt(p, true);
+        float body = cloudAt(p);
         if (body < 0.004) discard;
         float s, morning; dawnInfo(p, uSun, s, morning);
         float day = smoothstep(-0.12, 0.1, s);
@@ -490,12 +528,8 @@ function makeClouds(uniforms, lowDetail) {
         float diff = clamp(dot(normalize(vFacet.xyz), uSun) * 0.9 + 0.1, 0.0, 1.0) * (1.0 + vFacet.w);
         // Light and shade: compare with the cloud a little toward the sun. Sun-facing edges are bright, the far sides
         // of thick clouds fall into their own shadow.
-      #ifdef CLOUD_LOW
-        float relief = 0.0;
-      #else
-        float toward = cloudAt(normalize(p + uSun * 0.014), false);
+        float toward = cloudAt(normalize(p + uSun * 0.014));
         float relief = clamp((body - toward) * 1.6, -1.0, 1.0);
-      #endif
         // Thin wisps are greyer and let light through; thick cores are bright white.
         vec3 col = mix(vec3(0.74, 0.79, 0.88), vec3(1.0), body) * (0.2 + 0.8 * diff) * (0.9 + 0.22 * relief);
         float band = exp(-pow((s - 0.02) / 0.09, 2.0));
@@ -515,7 +549,7 @@ function makeClouds(uniforms, lowDetail) {
   });
   const mesh = new THREE.Mesh(g, m);
   mesh.renderOrder = 3; // after the city lights (2) so clouds veil them; dots (5) stay on top
-  return mesh;
+  return { mesh, bake };
 }
 
 // Every town of 50k+ people (from build-globe) becomes a little cluster of warm points; bigger towns spread wider.
@@ -609,13 +643,14 @@ function makeHourRing() {
     sp.scale.set(0.17, 0.085, 1);
     sp.renderOrder = 3;
     group.add(sp);
-    ticks.push({ k, lon, cv, tex, sp, last: '', dir: new THREE.Vector3(x, y, z), east: new THREE.Vector3(z, 0, -x).normalize() });
+    ticks.push({ k, lon, cv, tex, sp, last: '', state: '', drawnAt: 0, dir: new THREE.Vector3(x, y, z), east: new THREE.Vector3(z, 0, -x).normalize() });
   }
   const camDir = new THREE.Vector3();
   return {
     group,
     update(ms, sunV, camera) {
       camDir.copy(camera.position).normalize();
+      const now = performance.now();
       const utcMin = Math.floor(ms / 60000);
       for (const t of ticks) {
         const m = (((utcMin + t.k * 60) % 1440) + 1440) % 1440;
@@ -624,15 +659,19 @@ function makeHourRing() {
         const east = t.east.dot(sunV);
         const state = Math.abs(s) < 0.2 ? (east > 0 ? 'dawn' : 'dusk') : s > 0 ? 'day' : 'night';
         const text = `${hh}:${mm}|${state}|${t.k}`;
-        if (text !== t.last) {
+        // Behind the planet: fade out. Right in front of it: dim a little, so labels don't sit loudly on the land.
+        const facing = t.dir.dot(camDir);
+        const behind = Math.max(0, Math.min(1, (facing + 0.35) / 0.5));
+        // Redrawing a label means a canvas draw plus a texture upload. While scrubbing the minutes change every frame,
+        // so redraw at most ~8 times a second (straight away if the dawn/day/dusk/night colour changes), and skip
+        // labels hidden behind the planet: they catch up when they come round.
+        if (text !== t.last && behind > 0 && (state !== t.state || now - t.drawnAt > 120)) {
           t.last = text;
+          t.state = state;
+          t.drawnAt = now;
           drawLabel(t.cv, `${hh}:${mm}`, t.k, state);
           t.tex.needsUpdate = true;
         }
-        // Labels behind the planet fade out instead of popping.
-        const facing = t.dir.dot(camDir);
-        // Behind the planet: fade out. Right in front of it: dim a little, so labels don't sit loudly on the land.
-        const behind = Math.max(0, Math.min(1, (facing + 0.35) / 0.5));
         const front = 1 - 0.4 * Math.max(0, Math.min(1, (facing - 0.25) / 0.5));
         t.sp.material.opacity = behind * front;
       }

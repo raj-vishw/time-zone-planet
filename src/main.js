@@ -25,7 +25,8 @@ try {
   loading.classList.add('error');
   throw new Error('WebGL unavailable');
 }
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, coarse ? 1.75 : 2));
+let pixelRatio = Math.min(window.devicePixelRatio || 1, coarse ? 1.75 : 2);
+renderer.setPixelRatio(pixelRatio);
 // Pure black: with the bloom composer, three r160 sRGB-encodes the clear colour twice, which turns a dark navy grey.
 renderer.setClearColor(0x000000, 1);
 
@@ -316,7 +317,7 @@ function showTipAt(x, y, touch) {
 // --- boot ---
 let globe;
 try {
-  globe = await createGlobe(scene, 'globe/land.json', { lowDetail: coarse });
+  globe = await createGlobe(scene, 'globe/land.json', { lowDetail: coarse, renderer });
 } catch (err) {
   loading.textContent = 'Could not load the planet. Try reloading the page.';
   loading.classList.add('error');
@@ -370,13 +371,39 @@ if (!coarse && !params.has('nobloom')) {
     .catch(() => {});
 }
 
+// --- safety net for slow GPUs ---
+// If frames stay slow (under ~40 fps for a couple of seconds), render at a lower resolution, one step at a time down to
+// 1×; if that's still not enough, drop the glow pass. Only ever steps down, so it can't oscillate. `?hq` turns it off.
+const quality = { slowFor: 0, steps: [] };
+function watchFrameTime(rawDt) {
+  // A gap of over a second is the tab coming back, not a slow frame. Other frames count, capped, so one hiccup
+  // can't trip it but a machine that is slow on every frame does.
+  if (params.has('hq') || document.visibilityState === 'hidden' || rawDt > 1) return;
+  const dt = Math.min(rawDt, 0.25);
+  quality.slowFor = dt > 1 / 40 ? quality.slowFor + dt : Math.max(0, quality.slowFor - dt * 0.5);
+  if (quality.slowFor < 2) return;
+  quality.slowFor = 0;
+  if (pixelRatio > 1) {
+    pixelRatio = Math.max(1, pixelRatio - 0.25);
+    renderer.setPixelRatio(pixelRatio);
+    composer?.setPixelRatio(pixelRatio);
+    resize();
+    quality.steps.push(`resolution ${pixelRatio}×`);
+  } else if (composer) {
+    composer = null;
+    quality.steps.push('glow off');
+  }
+}
+
 // --- loop ---
 const clock = new THREE.Clock();
 let hudTimer = 0;
 let lastBucketT = null;
 
 function frame() {
-  const dt = Math.min(clock.getDelta(), 0.1);
+  const rawDt = clock.getDelta();
+  const dt = Math.min(rawDt, 0.1);
+  watchFrameTime(rawDt);
   const time = clock.elapsedTime;
 
   if (state.playing) {
@@ -425,4 +452,4 @@ requestAnimationFrame(() => {
 });
 
 // For headless checks.
-window.__tzp = { state, camera, scene, renderer, get composer() { return composer; }, get dots() { return dots; }, get globe() { return globe; }, net };
+window.__tzp = { state, camera, scene, renderer, get composer() { return composer; }, get dots() { return dots; }, get globe() { return globe; }, quality, net };

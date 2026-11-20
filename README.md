@@ -24,6 +24,7 @@ There's no geo data locally, so you're placed from your browser's time zone. The
 - `?demo` fills the globe with simulated visitors, clearly labelled **DEMO**. It works on any static server.
 - With any plain static server (`python -m http.server`), the page runs in **offline** mode and shows only you.
 - `?nobloom` turns off the glow pass. It's off on touch devices anyway.
+- On a slow GPU the page lowers its resolution, then turns off the glow, until it runs smoothly. `?hq` keeps full quality (for screenshots).
 
 ## Tests
 
