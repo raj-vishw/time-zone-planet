@@ -316,7 +316,7 @@ function showTipAt(x, y, touch) {
 // --- boot ---
 let globe;
 try {
-  globe = await createGlobe(scene, 'globe/land.json');
+  globe = await createGlobe(scene, 'globe/land.json', { lowDetail: coarse });
 } catch (err) {
   loading.textContent = 'Could not load the planet. Try reloading the page.';
   loading.classList.add('error');

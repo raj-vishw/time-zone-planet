@@ -21,7 +21,8 @@ const DAWN_GLSL = /* glsl */ `
   }
 `;
 
-export async function createGlobe(scene, landUrl) {
+/** opts.lowDetail: cheaper clouds (touch devices). */
+export async function createGlobe(scene, landUrl, opts = {}) {
   const data = await (await fetch(landUrl)).json();
   const heights = base64ToBytes(data.heights);
   const codes = base64ToBytes(data.faces);
@@ -196,7 +197,7 @@ export async function createGlobe(scene, landUrl) {
   scene.add(mesh);
 
   // --- Clouds: a faceted shell just above the lowlands (high plateaus poke through, as they do) ---
-  const clouds = makeClouds(uniforms);
+  const clouds = makeClouds(uniforms, !!opts.lowDetail);
   scene.add(clouds);
 
   // --- Atmosphere halo: the inside of a slightly bigger sphere, bright at the limb ---
@@ -396,79 +397,82 @@ function makeStars() {
   return new THREE.Points(g, m);
 }
 
-// Clouds are worked out per face of their own coarser icosphere, so they're faceted like the land. Cover follows the
-// real climate bands: a cloudy belt near the equator, clear subtropics (the big deserts), stormy mid-latitudes.
-// Features are squashed north-south so they stretch along the winds, and drift slowly east while they change shape.
-function makeClouds(uniforms) {
+// Clouds: a smooth shell just above the lowlands (high plateaus poke through, as they do). Cover is worked out per
+// pixel, so edges are soft and wispy rather than triangle-shaped. It follows the real climate bands: a cloudy belt
+// near the equator, clear subtropics (the big deserts), stormy mid-latitudes. Features are squashed north-south so
+// they stretch along the winds, gently warped so they curl, and drift slowly east while they change shape.
+function makeClouds(uniforms, lowDetail) {
   const R = 1.026;
-  const { positions: P, faces: F } = icosphere(36);
-  const nf = F.length / 3;
-  const pos = new Float32Array(nf * 9), centre = new Float32Array(nf * 9);
-  for (let f = 0; f < nf; f++) {
-    let cx = 0, cy = 0, cz = 0;
-    for (let k = 0; k < 3; k++) { const v = F[f * 3 + k]; cx += P[v * 3]; cy += P[v * 3 + 1]; cz += P[v * 3 + 2]; }
-    const l = Math.hypot(cx, cy, cz);
-    for (let k = 0; k < 3; k++) {
-      const v = F[f * 3 + k];
-      pos.set([P[v * 3] * R, P[v * 3 + 1] * R, P[v * 3 + 2] * R], f * 9 + k * 3);
-      centre.set([cx / l, cy / l, cz / l], f * 9 + k * 3);
-    }
-  }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  g.setAttribute('aCentre', new THREE.BufferAttribute(centre, 3));
-  g.computeVertexNormals();
+  const g = new THREE.SphereGeometry(R, 160, 112);
   const m = new THREE.ShaderMaterial({
     uniforms,
+    // Phones: 3 noise octaves instead of 5 and no light-and-shade pass, roughly half the per-pixel cost.
+    defines: lowDetail ? { CLOUD_LOW: '' } : {},
     transparent: true,
     depthWrite: false,
     vertexShader: /* glsl */ `
-      attribute vec3 aCentre;
-      uniform float uTime;
-      varying float vCover; varying float vThick; varying vec3 vN; varying vec3 vP;
+      varying vec3 vP;
+      void main() {
+        vP = position;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: /* glsl */ `
+      uniform vec3 uSun; uniform float uTime;
+      varying vec3 vP;
+      ${DAWN_GLSL}
       float hash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
       float noise(vec3 x) {
         vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
         return mix(mix(mix(hash(i), hash(i + vec3(1, 0, 0)), f.x), mix(hash(i + vec3(0, 1, 0)), hash(i + vec3(1, 1, 0)), f.x), f.y),
                    mix(mix(hash(i + vec3(0, 0, 1)), hash(i + vec3(1, 0, 1)), f.x), mix(hash(i + vec3(0, 1, 1)), hash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
       }
-      float fbm(vec3 p) { float a = 0.5, s = 0.0; for (int i = 0; i < 5; i++) { s += a * noise(p); p = p * 2.07 + vec3(1.7, 9.2, 3.1); a *= 0.5; } return s; }
-      void main() {
-        vec3 c = aCentre;
+      float fbm5(vec3 p) { float a = 0.5, s = 0.0; for (int i = 0; i < 5; i++) { s += a * noise(p); p = p * 2.07 + vec3(1.7, 9.2, 3.1); a *= 0.5; } return s; }
+      float fbm3(vec3 p) { float a = 0.5, s = 0.0; for (int i = 0; i < 3; i++) { s += a * noise(p); p = p * 2.07 + vec3(1.7, 9.2, 3.1); a *= 0.5; } return s + 0.047; } // + the octaves it skips, on average
+
+      // How much cloud at unit vector c: 0 clear .. 1 thick. 'detail' picks the full or the cheap noise.
+      float cloudAt(vec3 c, bool detail) {
         float lat = asin(clamp(c.y, -1.0, 1.0)) * 57.29578, al = abs(lat);
-        // Slow eastward drift plus slow change of shape.
-        float a = uTime * 0.004;
+        float a = uTime * 0.004; // slow eastward drift
         vec3 q = vec3(c.x * cos(a) - c.z * sin(a), c.y, c.x * sin(a) + c.z * cos(a));
-        float n = fbm(vec3(q.x * 4.2, q.y * 8.0, q.z * 4.2) + vec3(0.0, 0.0, uTime * 0.006));
+        vec3 sp = vec3(q.x * 4.2, q.y * 8.0, q.z * 4.2) + vec3(0.0, 0.0, uTime * 0.006);
+        // Warp the lookup by a coarse noise so shapes curl and streak instead of forming round blobs.
+        sp += (vec3(noise(sp * 0.7 + 3.1), noise(sp * 0.7 + 7.7), noise(sp * 0.7 + 1.3)) - 0.5) * 0.9;
+      #ifdef CLOUD_LOW
+        float n = fbm3(sp);
+      #else
+        float n = detail ? fbm5(sp) : fbm3(sp);
+      #endif
         // Threshold on the noise: lower = more cloud. fbm is ~0.47 ± 0.1, so 0.5 ≈ 40% cover, 0.57 ≈ 15%.
         float t = 0.55
           - 0.045 * exp(-pow(lat / 9.0, 2.0))           // tropical rain belt
           + 0.05 * exp(-pow((al - 23.0) / 8.0, 2.0))    // dry subtropics
           - 0.06 * exp(-pow((al - 55.0) / 11.0, 2.0))   // mid-latitude storm tracks
           + 0.05 * smoothstep(70.0, 88.0, al);          // dry polar air
-        // Soft edges: thin and translucent at the fringe, thick in the middle, plus a little per-face variety.
-        float body = smoothstep(t - 0.01, t + 0.13, n);
-        vCover = body * (0.75 + 0.25 * hash(c * 91.7)) * 0.88;
-        vThick = body;
-        vN = normal; vP = position;
-        gl_Position = vCover < 0.01 ? vec4(2.0, 2.0, 2.0, 1.0) : projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }`,
-    fragmentShader: /* glsl */ `
-      uniform vec3 uSun;
-      varying float vCover; varying float vThick; varying vec3 vN; varying vec3 vP;
-      ${DAWN_GLSL}
+        return smoothstep(t - 0.015, t + 0.11, n);
+      }
+
       void main() {
-        vec3 p = normalize(vP), n = normalize(vN);
+        vec3 p = normalize(vP);
+        float body = cloudAt(p, true);
+        if (body < 0.004) discard;
         float s, morning; dawnInfo(p, uSun, s, morning);
         float day = smoothstep(-0.12, 0.1, s);
-        float diff = max(dot(n, uSun), 0.0);
-        // Thin cloud edges are greyer and let more light through; thick cores are bright white.
-        vec3 col = mix(vec3(0.78, 0.82, 0.9), vec3(1.0), vThick) * (0.2 + 0.8 * diff);
+        float diff = clamp(dot(p, uSun) * 0.9 + 0.1, 0.0, 1.0);
+        // Light and shade: compare with the cloud a little toward the sun. Sun-facing edges are bright, the far sides
+        // of thick clouds fall into their own shadow.
+      #ifdef CLOUD_LOW
+        float relief = 0.0;
+      #else
+        float toward = cloudAt(normalize(p + uSun * 0.014), false);
+        float relief = clamp((body - toward) * 1.6, -1.0, 1.0);
+      #endif
+        // Thin wisps are greyer and let light through; thick cores are bright white.
+        vec3 col = mix(vec3(0.74, 0.79, 0.88), vec3(1.0), body) * (0.2 + 0.8 * diff) * (0.9 + 0.22 * relief);
         float band = exp(-pow((s - 0.02) / 0.09, 2.0));
         float dawnSide = smoothstep(-0.15, 0.35, morning);
         col = mix(col, col * mix(vec3(1.0, 0.45, 0.4), vec3(1.0, 0.68, 0.3), dawnSide) * 1.5, band * 0.75);
         col = mix(vec3(0.0035, 0.0055, 0.011), col, day); // at night: about as dark as the ground below
-        float a = vCover * mix(0.45, 0.78, day); // night clouds are dim but still veil the city lights
+        float a = body * 0.88 * mix(0.45, 0.8, day);       // night clouds are dim but still veil the city lights
         gl_FragColor = vec4(col, a);
         #include <colorspace_fragment>
         // Premultiply after the colour-space conversion: before it, dark night clouds come out brighter than the
