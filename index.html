@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Time-Zone Planet</title>
+  <meta name="description" content="A low-poly globe lit by the real sun. Everyone on the site right now is a glowing dot, so you can watch the world wake up live." />
+  <meta name="theme-color" content="#000000" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="Time-Zone Planet" />
+  <meta property="og:description" content="Watch the world wake up live: a low-poly globe, the real dawn line sweeping across it, and every visitor as a glowing dot." />
+  <meta property="og:image" content="og.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Time-Zone Planet" />
+  <meta name="twitter:description" content="Watch the world wake up live." />
+  <meta name="twitter:image" content="og.png" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%23123a63'/%3E%3Cpath d='M16 3a13 13 0 0 1 0 26z' fill='%23ffb547'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="style.css" />
+  <!-- The import map has to come before any module loading. -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.min.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+  <link rel="modulepreload" href="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.min.js" />
+  <link rel="modulepreload" href="https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js" />
+  <link rel="modulepreload" href="src/main.js" />
+  <link rel="preload" href="globe/land.json" as="fetch" crossorigin="anonymous" />
+</head>
+<body>
+  <canvas id="scene" aria-label="A 3D globe showing day and night and where visitors are right now"></canvas>
+
+  <div id="loading" role="status">Spinning up the planet…</div>
+
+  <header class="hud top-left">
+    <h1>Time-Zone Planet</h1>
+    <div class="clock"><span id="clock-time">--:--:--</span></div>
+    <div id="clock-date" class="sub">UTC</div>
+    <div id="sun-point" class="sub dim"></div>
+  </header>
+
+  <div class="hud top-right">
+  <section class="status-block" aria-live="polite">
+    <div id="status" class="pill" data-mode="connecting"><span class="led" aria-hidden="true"></span><span id="status-text">Connecting…</span></div>
+    <div id="waking" class="waking" hidden></div>
+    <div id="earlier" class="earlier" hidden><span class="faint-dot" aria-hidden="true"></span><span id="earlier-text"></span></div>
+  </section>
+
+  <aside id="sunrise" class="panel">
+    <button id="sunrise-toggle" class="panel-head" type="button" aria-expanded="false" aria-controls="sunrise-list">
+      <span class="sun-glyph" aria-hidden="true"></span> Sunrise now
+    </button>
+    <ul id="sunrise-list"></ul>
+  </aside>
+  </div>
+
+  <footer class="hud bottom">
+    <button id="you" class="you" type="button" hidden></button>
+    <div class="timebar">
+      <button id="play" type="button" class="icon" aria-label="Replay the last 24 hours">▶</button>
+      <div class="track">
+        <input id="scrub" type="range" min="-24" max="0" step="0.01" value="0" aria-label="Time, from 24 hours ago to now" />
+        <div class="ticks" aria-hidden="true"><span>−24h</span><span>−18h</span><span>−12h</span><span>−6h</span><span>now</span></div>
+      </div>
+      <span id="when" class="when">Live</span>
+      <button id="live" type="button" class="chip on" aria-pressed="true">LIVE</button>
+      <button id="follow" type="button" class="chip" aria-pressed="false" title="Keep the dawn line in view">Follow the sun</button>
+    </div>
+    <p class="fine">Locations rounded to ~50 km · no IPs stored · land from Natural Earth</p>
+  </footer>
+
+  <div id="tip" class="tip" role="tooltip" hidden></div>
+
+  <noscript><p class="noscript">Time-Zone Planet needs JavaScript and WebGL.</p></noscript>
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>

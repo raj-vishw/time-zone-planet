@@ -1,0 +1,5 @@
+PLAN.md
+# cached Natural Earth download used by tools/build-globe.mjs
+tools/.cache/
+node_modules/
+.vercel/

@@ -1,0 +1,11 @@
+{
+  "name": "time-zone-planet",
+  "private": true,
+  "type": "module",
+  "description": "A low-poly globe lit by the real sun, with every visitor as a glowing dot.",
+  "scripts": {
+    "build:globe": "node tools/build-globe.mjs",
+    "test": "node tools/test-sun.mjs && node tools/test-api.mjs"
+  },
+  "engines": { "node": ">=18" }
+}
