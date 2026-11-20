@@ -2,36 +2,13 @@
 import * as THREE from 'three';
 import { icosphere, base64ToBytes, hash01, latLonToVec, vecToLatLon } from './geo.js';
 
-export const RELIEF = 0.055; // tallest mountain, as a fraction of the planet radius
+export const RELIEF = 0.05; // the highest land (Everest region) as a fraction of the planet radius: ~50× real
 
-const C = (hex) => new THREE.Color(hex); // sRGB hex → linear working colour
-const OCEAN = [C('#2a9bb8'), C('#1a6f9a'), C('#155a86'), C('#114876'), C('#0d3a64'), C('#0b3058')];
-const PAL = {
-  grass: [C('#6aa84f'), C('#5b9a45'), C('#4f8a3e')],
-  forest: [C('#3f7a3a'), C('#356c33')],
-  hill: [C('#8c8a55'), C('#7d7a4c')],
-  rock: [C('#8a7563'), C('#77665a')],
-  snow: [C('#eef3f7'), C('#dfe8ee')],
-  desert: [C('#e0b872'), C('#d4a660'), C('#c9975a')],
-  tundra: [C('#9aa27e'), C('#8c9474')],
-  ice: [C('#eef5fa'), C('#dbe9f2'), C('#cfe2ee')],
-};
-const pick = (arr, r) => arr[Math.min(arr.length - 1, Math.floor(r * arr.length))];
-
-// Smooth 3D value noise, so forests, grassland and shading come in patches rather than a per-face checkerboard.
-function vnoise(x, y, z) {
-  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
-  const xf = x - xi, yf = y - yi, zf = z - zi;
-  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf), w = zf * zf * (3 - 2 * zf);
-  const h = (a, b, c) => hash01(((a * 73856093) ^ (b * 19349663) ^ (c * 83492791)) | 0);
-  const l = (a, b, t) => a + (b - a) * t;
-  return l(
-    l(l(h(xi, yi, zi), h(xi + 1, yi, zi), u), l(h(xi, yi + 1, zi), h(xi + 1, yi + 1, zi), u), v),
-    l(l(h(xi, yi, zi + 1), h(xi + 1, yi, zi + 1), u), l(h(xi, yi + 1, zi + 1), h(xi + 1, yi + 1, zi + 1), u), v),
-    w,
-  );
-}
-const fbm = (x, y, z) => vnoise(x * 4, y * 4, z * 4) * 0.65 + vnoise(x * 11 + 7, y * 11, z * 11) * 0.35;
+// Face colours come from NASA Blue Marble (via build-globe), stored as a 256-colour palette. The raw imagery is dark,
+// so it's graded here: a curve that lifts shadows and mid-tones but rolls off the highlights, so deserts and ice don't
+// blow out. The sea gets a stronger lift so the light continental shelves read against the deep ocean.
+const grade = (v, k) => 1 - Math.pow(1 - v, k);
+const LAND_LIFT = 1.5, SEA_LIFT = 1.75, LAND_SAT = 1.15;
 
 // Shared GLSL: where is this point relative to the dawn line?
 const DAWN_GLSL = /* glsl */ `
@@ -90,42 +67,57 @@ export async function createGlobe(scene, landUrl) {
     return Math.max(r1, r2, r3);
   }
 
+  // Palette (sRGB bytes) → graded linear colours, once per palette entry.
+  const palBytes = base64ToBytes(data.palette), colourIdx = base64ToBytes(data.colours);
+  if (colourIdx.length !== nf) throw new Error('globe/land.json colours do not match the mesh');
+  const palLand = [], palSea = [];
+  for (let i = 0; i < palBytes.length / 3; i++) {
+    const r = palBytes[i * 3] / 255, g = palBytes[i * 3 + 1] / 255, b = palBytes[i * 3 + 2] / 255;
+    const land = new THREE.Color().setRGB(grade(r, LAND_LIFT), grade(g, LAND_LIFT), grade(b, LAND_LIFT), THREE.SRGBColorSpace);
+    const hsl = {};
+    land.getHSL(hsl);
+    land.setHSL(hsl.h, Math.min(1, hsl.s * LAND_SAT), hsl.l);
+    palLand.push(land);
+    palSea.push(new THREE.Color().setRGB(grade(r, SEA_LIFT), grade(g, SEA_LIFT), grade(b, SEA_LIFT), THREE.SRGBColorSpace));
+  }
+
+  // The imagery is noisy at this scale, which reads as a mosaic. Blend each face with the faces around its corners
+  // (land with land, sea with sea, so coasts stay crisp). Facets still show through the lighting and the jitter.
+  const base = new Float32Array(nf * 3), acc = new Float32Array(nv * 8); // per vertex: land rgb+n, sea rgb+n
+  for (let f = 0; f < nf; f++) {
+    const isLand = codes[f] >= 64, src = (isLand ? palLand : palSea)[colourIdx[f]];
+    base[f * 3] = src.r; base[f * 3 + 1] = src.g; base[f * 3 + 2] = src.b;
+    for (let k = 0; k < 3; k++) {
+      const o = F[f * 3 + k] * 8 + (isLand ? 0 : 4);
+      acc[o] += src.r; acc[o + 1] += src.g; acc[o + 2] += src.b; acc[o + 3]++;
+    }
+  }
+  const SMOOTH = 0.55;
+
   const pos = new Float32Array(nf * 9), col = new Float32Array(nf * 9), kind = new Float32Array(nf * 3);
   const c = new THREE.Color();
   for (let f = 0; f < nf; f++) {
-    let hSum = 0, hMax = 0, cx = 0, cy = 0, cz = 0;
     for (let k = 0; k < 3; k++) {
       const v = F[f * 3 + k], r = radius[v];
       pos[f * 9 + k * 3] = P[v * 3] * r;
       pos[f * 9 + k * 3 + 1] = P[v * 3 + 1] * r;
       pos[f * 9 + k * 3 + 2] = P[v * 3 + 2] * r;
-      const h = heights[v] / 255;
-      hSum += h; hMax = Math.max(hMax, h);
-      cx += P[v * 3]; cy += P[v * 3 + 1]; cz += P[v * 3 + 2];
     }
-    // j: smooth patch noise (which palette entry); j2: tiny per-face jitter that keeps the facets readable.
-    const code = codes[f], h = hSum / 3, nz = fbm(cx / 3, cy / 3, cz / 3), j = Math.min(0.999, Math.max(0, (nz - 0.25) * 2)), j2 = hash01(f + 99991);
-    const lat = Math.asin(cy / 3) * 57.29578;
-    let k = 0;
-    if (code < 64) {
-      c.copy(OCEAN[Math.min(OCEAN.length - 1, code - 1 < 0 ? 0 : code - 1)]);
-      if (Math.abs(lat) > 66) c.lerp(C('#3d6f8f'), (Math.abs(lat) - 66) / 30); // colder, greyer seas near the poles
-      c.multiplyScalar(0.97 + j2 * 0.05);
-    } else {
-      const biome = code - 64;
-      k = biome === 2 ? 2 : 1;
-      if (biome === 2) c.copy(pick(PAL.ice, j));
-      else if (h > 0.8 || (hMax > 0.9 && h > 0.6)) c.copy(pick(PAL.snow, j));
-      else if (h > 0.52) c.copy(pick(PAL.rock, j));
-      else if (biome === 1) c.copy(h > 0.32 ? pick(PAL.rock, j) : pick(PAL.desert, j));
-      else if (biome === 3) c.copy(h > 0.34 ? pick(PAL.rock, j) : pick(PAL.tundra, j));
-      else if (h > 0.32) c.copy(pick(PAL.hill, j));
-      else c.copy(nz > 0.52 ? pick(PAL.forest, j2) : pick(PAL.grass, j));
-      c.multiplyScalar(0.95 + j2 * 0.08);
+    const isLand = codes[f] >= 64;
+    let r = 0, g = 0, b = 0, n = 0;
+    for (let k = 0; k < 3; k++) {
+      const o = F[f * 3 + k] * 8 + (isLand ? 0 : 4);
+      r += acc[o]; g += acc[o + 1]; b += acc[o + 2]; n += acc[o + 3];
     }
-    for (let k3 = 0; k3 < 3; k3++) {
-      col[f * 9 + k3 * 3] = c.r; col[f * 9 + k3 * 3 + 1] = c.g; col[f * 9 + k3 * 3 + 2] = c.b;
-      kind[f * 3 + k3] = k;
+    c.setRGB(
+      base[f * 3] * (1 - SMOOTH) + (r / n) * SMOOTH,
+      base[f * 3 + 1] * (1 - SMOOTH) + (g / n) * SMOOTH,
+      base[f * 3 + 2] * (1 - SMOOTH) + (b / n) * SMOOTH,
+    );
+    c.multiplyScalar(0.96 + hash01(f + 99991) * 0.07); // a touch of per-face jitter keeps the facets readable
+    for (let k = 0; k < 3; k++) {
+      col[f * 9 + k * 3] = c.r; col[f * 9 + k * 3 + 1] = c.g; col[f * 9 + k * 3 + 2] = c.b;
+      kind[f * 3 + k] = isLand ? 1 : 0;
     }
   }
   const geo = new THREE.BufferGeometry();
@@ -163,7 +155,7 @@ export async function createGlobe(scene, landUrl) {
         float day = smoothstep(-0.1, 0.12, s);
         float dawnSide = smoothstep(-0.15, 0.35, morning);
 
-        vec3 night = vColor * 0.05 + vec3(0.004, 0.009, 0.028);
+        vec3 night = vColor * 0.03 + vec3(0.003, 0.006, 0.02);
         vec3 lit = vColor * (0.12 + 1.0 * diff);
         vec3 col = mix(night, lit, day);
 
@@ -179,7 +171,9 @@ export async function createGlobe(scene, landUrl) {
         if (vKind < 0.5) {
           vec3 h = normalize(uSun + v);
           vec3 sn = normalize(mix(n, p, 0.8));
-          col += pow(max(dot(sn, h), 0.0), 120.0) * day * vec3(1.0, 0.9, 0.75) * 0.22;
+          col += pow(max(dot(sn, h), 0.0), 140.0) * day * vec3(1.0, 0.9, 0.75) * 0.3;
+          // Sky reflected off the water toward the limb.
+          col += pow(1.0 - max(dot(v, sn), 0.0), 5.0) * vec3(0.16, 0.3, 0.55) * 0.18 * day;
         }
 
         // Hour meridians every 15° of longitude.
@@ -187,7 +181,7 @@ export async function createGlobe(scene, landUrl) {
         float d = abs(fract(hours + 0.5) - 0.5);
         float line = 1.0 - smoothstep(0.0, fwidth(hours) * 1.3, d);
         line *= 1.0 - smoothstep(0.72, 0.92, abs(p.y));
-        col += vec3(0.45, 0.65, 1.0) * line * mix(0.018, 0.02, day);
+        col += vec3(0.45, 0.65, 1.0) * line * mix(0.008, 0.014, day);
 
         // Atmospheric haze toward the limb.
         float rim = pow(1.0 - max(dot(v, p), 0.0), 3.0);
@@ -200,6 +194,10 @@ export async function createGlobe(scene, landUrl) {
   });
   const mesh = new THREE.Mesh(geo, globeMat);
   scene.add(mesh);
+
+  // --- Clouds: a faceted shell just above the lowlands (high plateaus poke through, as they do) ---
+  const clouds = makeClouds(uniforms);
+  scene.add(clouds);
 
   // --- Atmosphere halo: the inside of a slightly bigger sphere, bright at the limb ---
   const atmoMat = new THREE.ShaderMaterial({
@@ -224,7 +222,7 @@ export async function createGlobe(scene, landUrl) {
         float s, morning; dawnInfo(p, uSun, s, morning);
         // We see the inside of this shell: normals point away from us. Facing straight away = behind the planet,
         // edge-on = the outer rim of the halo. Glow peaks around the planet's limb and fades out to the rim.
-        float k = pow(clamp(-vN.z / 0.55, 0.0, 1.0), 3.0);
+        float k = pow(clamp(-vN.z / 0.42, 0.0, 1.0), 2.6);
         float day = smoothstep(-0.25, 0.3, s);
         float band = exp(-pow(s / 0.16, 2.0));
         vec3 col = mix(vec3(0.03, 0.06, 0.18), vec3(0.3, 0.6, 1.0), day);
@@ -233,7 +231,7 @@ export async function createGlobe(scene, landUrl) {
         #include <colorspace_fragment>
       }`,
   });
-  const atmo = new THREE.Mesh(new THREE.SphereGeometry(1.16, 96, 64), atmoMat);
+  const atmo = new THREE.Mesh(new THREE.SphereGeometry(1.1, 128, 96), atmoMat);
   scene.add(atmo);
 
   // --- The ray of light: a glowing curtain standing on the dawn line ---
@@ -398,6 +396,94 @@ function makeStars() {
   return new THREE.Points(g, m);
 }
 
+// Clouds are worked out per face of their own coarser icosphere, so they're faceted like the land. Cover follows the
+// real climate bands: a cloudy belt near the equator, clear subtropics (the big deserts), stormy mid-latitudes.
+// Features are squashed north-south so they stretch along the winds, and drift slowly east while they change shape.
+function makeClouds(uniforms) {
+  const R = 1.026;
+  const { positions: P, faces: F } = icosphere(36);
+  const nf = F.length / 3;
+  const pos = new Float32Array(nf * 9), centre = new Float32Array(nf * 9);
+  for (let f = 0; f < nf; f++) {
+    let cx = 0, cy = 0, cz = 0;
+    for (let k = 0; k < 3; k++) { const v = F[f * 3 + k]; cx += P[v * 3]; cy += P[v * 3 + 1]; cz += P[v * 3 + 2]; }
+    const l = Math.hypot(cx, cy, cz);
+    for (let k = 0; k < 3; k++) {
+      const v = F[f * 3 + k];
+      pos.set([P[v * 3] * R, P[v * 3 + 1] * R, P[v * 3 + 2] * R], f * 9 + k * 3);
+      centre.set([cx / l, cy / l, cz / l], f * 9 + k * 3);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('aCentre', new THREE.BufferAttribute(centre, 3));
+  g.computeVertexNormals();
+  const m = new THREE.ShaderMaterial({
+    uniforms,
+    transparent: true,
+    depthWrite: false,
+    vertexShader: /* glsl */ `
+      attribute vec3 aCentre;
+      uniform float uTime;
+      varying float vCover; varying float vThick; varying vec3 vN; varying vec3 vP;
+      float hash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+      float noise(vec3 x) {
+        vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+        return mix(mix(mix(hash(i), hash(i + vec3(1, 0, 0)), f.x), mix(hash(i + vec3(0, 1, 0)), hash(i + vec3(1, 1, 0)), f.x), f.y),
+                   mix(mix(hash(i + vec3(0, 0, 1)), hash(i + vec3(1, 0, 1)), f.x), mix(hash(i + vec3(0, 1, 1)), hash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+      }
+      float fbm(vec3 p) { float a = 0.5, s = 0.0; for (int i = 0; i < 5; i++) { s += a * noise(p); p = p * 2.07 + vec3(1.7, 9.2, 3.1); a *= 0.5; } return s; }
+      void main() {
+        vec3 c = aCentre;
+        float lat = asin(clamp(c.y, -1.0, 1.0)) * 57.29578, al = abs(lat);
+        // Slow eastward drift plus slow change of shape.
+        float a = uTime * 0.004;
+        vec3 q = vec3(c.x * cos(a) - c.z * sin(a), c.y, c.x * sin(a) + c.z * cos(a));
+        float n = fbm(vec3(q.x * 4.2, q.y * 8.0, q.z * 4.2) + vec3(0.0, 0.0, uTime * 0.006));
+        // Threshold on the noise: lower = more cloud. fbm is ~0.47 ± 0.1, so 0.5 ≈ 40% cover, 0.57 ≈ 15%.
+        float t = 0.55
+          - 0.045 * exp(-pow(lat / 9.0, 2.0))           // tropical rain belt
+          + 0.05 * exp(-pow((al - 23.0) / 8.0, 2.0))    // dry subtropics
+          - 0.06 * exp(-pow((al - 55.0) / 11.0, 2.0))   // mid-latitude storm tracks
+          + 0.05 * smoothstep(70.0, 88.0, al);          // dry polar air
+        // Soft edges: thin and translucent at the fringe, thick in the middle, plus a little per-face variety.
+        float body = smoothstep(t - 0.01, t + 0.13, n);
+        vCover = body * (0.75 + 0.25 * hash(c * 91.7)) * 0.88;
+        vThick = body;
+        vN = normal; vP = position;
+        gl_Position = vCover < 0.01 ? vec4(2.0, 2.0, 2.0, 1.0) : projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: /* glsl */ `
+      uniform vec3 uSun;
+      varying float vCover; varying float vThick; varying vec3 vN; varying vec3 vP;
+      ${DAWN_GLSL}
+      void main() {
+        vec3 p = normalize(vP), n = normalize(vN);
+        float s, morning; dawnInfo(p, uSun, s, morning);
+        float day = smoothstep(-0.12, 0.1, s);
+        float diff = max(dot(n, uSun), 0.0);
+        // Thin cloud edges are greyer and let more light through; thick cores are bright white.
+        vec3 col = mix(vec3(0.78, 0.82, 0.9), vec3(1.0), vThick) * (0.2 + 0.8 * diff);
+        float band = exp(-pow((s - 0.02) / 0.09, 2.0));
+        float dawnSide = smoothstep(-0.15, 0.35, morning);
+        col = mix(col, col * mix(vec3(1.0, 0.45, 0.4), vec3(1.0, 0.68, 0.3), dawnSide) * 1.5, band * 0.75);
+        col = mix(vec3(0.0035, 0.0055, 0.011), col, day); // at night: about as dark as the ground below
+        float a = vCover * mix(0.45, 0.78, day); // night clouds are dim but still veil the city lights
+        gl_FragColor = vec4(col, a);
+        #include <colorspace_fragment>
+        // Premultiply after the colour-space conversion: before it, dark night clouds come out brighter than the
+        // ground under them (the sRGB curve is steep near black) and lay a pale veil over the night side.
+        gl_FragColor.rgb *= a;
+      }`,
+    blending: THREE.CustomBlending,
+    blendSrc: THREE.OneFactor,
+    blendDst: THREE.OneMinusSrcAlphaFactor,
+  });
+  const mesh = new THREE.Mesh(g, m);
+  mesh.renderOrder = 3; // after the city lights (2) so clouds veil them; dots (5) stay on top
+  return mesh;
+}
+
 // Every town of 50k+ people (from build-globe) becomes a little cluster of warm points; bigger towns spread wider.
 // Each point has its own switch-off moment in the twilight band, so dawn turns the lights off one by one
 // just ahead of the gold band, and dusk turns them back on.
@@ -468,9 +554,9 @@ function makeLights(bytes, surfaceRadius, uniforms) {
 // 24 labels around the equator: the clock time on each hour meridian (UTC + lon/15), like a bezel.
 function makeHourRing() {
   const group = new THREE.Group();
-  const R = 1.36;
+  const R = 1.25;
   const ringGeo = new THREE.BufferGeometry().setFromPoints(
-    Array.from({ length: 241 }, (_, i) => new THREE.Vector3(Math.sin((i / 240) * Math.PI * 2) * 1.3, 0, Math.cos((i / 240) * Math.PI * 2) * 1.3)),
+    Array.from({ length: 241 }, (_, i) => new THREE.Vector3(Math.sin((i / 240) * Math.PI * 2) * 1.2, 0, Math.cos((i / 240) * Math.PI * 2) * 1.2)),
   );
   const ringLine = new THREE.Line(ringGeo, new THREE.LineBasicMaterial({ color: 0x5f8fd0, transparent: true, opacity: 0.18, depthWrite: false }));
   group.add(ringLine);
@@ -486,7 +572,7 @@ function makeHourRing() {
     const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }));
     const [x, y, z] = latLonToVec(0, lon);
     sp.position.set(x * R, y * R, z * R);
-    sp.scale.set(0.2, 0.1, 1);
+    sp.scale.set(0.17, 0.085, 1);
     sp.renderOrder = 3;
     group.add(sp);
     ticks.push({ k, lon, cv, tex, sp, last: '', dir: new THREE.Vector3(x, y, z), east: new THREE.Vector3(z, 0, -x).normalize() });
@@ -511,7 +597,10 @@ function makeHourRing() {
         }
         // Labels behind the planet fade out instead of popping.
         const facing = t.dir.dot(camDir);
-        t.sp.material.opacity = Math.max(0, Math.min(1, (facing + 0.35) / 0.5));
+        // Behind the planet: fade out. Right in front of it: dim a little, so labels don't sit loudly on the land.
+        const behind = Math.max(0, Math.min(1, (facing + 0.35) / 0.5));
+        const front = 1 - 0.4 * Math.max(0, Math.min(1, (facing - 0.25) / 0.5));
+        t.sp.material.opacity = behind * front;
       }
     },
   };

@@ -7,5 +7,10 @@
     "build:globe": "node tools/build-globe.mjs",
     "test": "node tools/test-sun.mjs && node tools/test-api.mjs"
   },
-  "engines": { "node": ">=18" }
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "jpeg-js": "^0.4.4"
+  }
 }

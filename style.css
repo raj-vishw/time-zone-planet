@@ -57,7 +57,7 @@ button { font: inherit; color: inherit; }
 .hud button, .hud input, .hud a { pointer-events: auto; }
 
 /* --- top left: title + clock --- */
-.top-left { top: max(16px, env(safe-area-inset-top)); left: var(--gutter); }
+.top-left { top: max(16px, env(safe-area-inset-top)); left: var(--gutter); text-shadow: 0 1px 10px rgba(0, 0, 0, 0.85); }
 h1 {
   margin: 0 0 6px;
   font-size: 11px;
@@ -324,6 +324,11 @@ input[type='range']:focus-visible { outline: 2px solid var(--gold); outline-offs
   .track { order: 5; flex-basis: 100%; }
   .when { width: auto; flex: 1; text-align: left; }
   .fine { display: none; }
+}
+
+/* narrow phones: keep the status pill clear of the title */
+@media (max-width: 380px) {
+  .status-block { max-width: 46vw; }
 }
 
 @media (prefers-reduced-motion: reduce) {

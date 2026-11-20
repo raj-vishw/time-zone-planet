@@ -39,7 +39,7 @@ controls.dampingFactor = 0.07;
 controls.enablePan = false;
 controls.rotateSpeed = 0.55;
 controls.zoomSpeed = 0.7;
-controls.minDistance = 1.5;
+controls.minDistance = 1.2; // close enough to see single mountain ranges
 controls.maxDistance = 9;
 controls.autoRotateSpeed = 0.35;
 
@@ -95,18 +95,24 @@ controls.addEventListener('start', () => {
 });
 controls.addEventListener('end', () => { state.lastInteraction = performance.now(); });
 
-// --- size: keep the planet comfortably inside the smaller screen dimension ---
+// --- size: the planet fills ~82% of the screen height on wide screens and ~94% of the width on phones.
+// The hour ring is wider than the planet; its side labels may run off a narrow screen, and that's fine. ---
+const FILL_WIDE = 0.82, FILL_NARROW = 0.94;
 function fitDistance() {
   const aspect = camera.aspect;
   const vHalf = (camera.fov / 2) * DEG;
-  const half = aspect >= 1 ? vHalf : Math.atan(Math.tan(vHalf) * aspect);
-  return 1.36 / Math.sin(half * (aspect < 0.8 ? 0.92 : 0.78));
+  const narrow = aspect < 0.8;
+  const half = narrow ? Math.atan(Math.tan(vHalf) * aspect) : vHalf;
+  return 1 / Math.sin(half * (narrow ? FILL_NARROW : FILL_WIDE));
 }
 
 function resize() {
   const w = window.innerWidth, h = window.innerHeight;
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
+  // Nudge the planet up a little on wide screens so the time bar at the bottom covers less of it.
+  if (w / h >= 0.8) camera.setViewOffset(w, h, 0, h * 0.025, w, h);
+  else camera.clearViewOffset();
   camera.updateProjectionMatrix();
   composer?.setSize(w, h);
   if (!state.interacted) camera.position.setLength(fitDistance());

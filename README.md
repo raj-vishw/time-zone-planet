@@ -1,9 +1,12 @@
 # Time-Zone Planet
 
-A low-poly globe lit by the real sun. A ray of light rides the dawn line as it sweeps around the planet, and everyone on the site right now is a glowing dot, so you can watch the world wake up live.
+A low-poly model of the real Earth, lit by the real sun. A ray of light rides the dawn line as it sweeps around the planet, and everyone on the site right now is a glowing dot, so you can watch the world wake up live.
 
 - **Real sunlight.** The day/night line is computed from the current UTC time (solar declination plus the equation of time).
+- **The real Earth, faceted.** 46,000 flat-shaded faces coloured from NASA Blue Marble satellite imagery, with mountains raised from NASA topography and ocean colour following real depth. Clouds drift in a faceted layer that follows the climate bands and turns gold at dawn.
 - **Live visitors.** Each place with people on the site gets a dot that pulses, grows with the crowd and flares as dawn passes over it. Hover or tap a dot to see its local time.
+- **Earlier visitors.** Places visited in the last 24 hours that nobody is at right now stay on the globe as faint dots. They still flare as dawn reaches them, so the globe never looks empty.
+- **City lights.** Every town of 50,000+ people glows on the night side. The lights switch off one by one through twilight as dawn comes, and back on at dusk.
 - **Replay.** Drag the time bar or press ▶ to replay the last 24 hours. The dawn line sweeps the globe while past visits light up hour by hour.
 - **Follow the sun.** This button keeps the camera on the dawn line.
 - **Sunrise now.** A list of places where the sun is coming up right now. Click one to fly there.
@@ -26,7 +29,8 @@ There's no geo data locally, so you're placed from your browser's time zone. The
 
 ```sh
 npm test                       # sun maths + API handlers against a fake Redis
-npm run build:globe            # rebuild globe/land.json (downloads Natural Earth land once into tools/.cache)
+npm install                    # only needed to rebuild the globe: installs the dev-only JPEG decoder
+npm run build:globe            # rebuild globe/land.json (~1.5 min; downloads the source data once into tools/.cache)
 ```
 
 ## Deploy (Vercel)
@@ -42,23 +46,23 @@ The `og:image` tags are relative. Swap in the full URL once the domain is known.
 | Piece | Where |
 |---|---|
 | Sun position, local times | `src/sun.js` |
-| Low-poly mesh, day/night/dawn shader, light curtain, atmosphere, hour ring | `src/globe.js` |
+| Low-poly mesh, day/night/dawn shader, clouds, light curtain, city lights, atmosphere, hour ring | `src/globe.js` |
 | Visitor dots (one instanced draw call, glow and flare on the GPU) | `src/dots.js` |
 | Heartbeat, polling, offline fallback, demo | `src/net.js` |
 | HUD | `src/hud.js`, `style.css` |
 | `POST /api/beat`, `GET /api/live`, `GET /api/history` | `api/` |
-| Land mask + relief, precomputed | `tools/build-globe.mjs` → `globe/land.json` |
+| Land mask, face colours (256-colour palette), relief and city lights, precomputed | `tools/build-globe.mjs` → `globe/land.json` (~73 KB gzipped) |
 
-The browser sends a heartbeat every 60 s and polls `/api/live` every 20 s. The CDN caches `/api/live` for 15 s, so Redis traffic stays flat however many people are watching.
+The browser sends a heartbeat every 60 s and polls `/api/live` every 20 s. A repeat heartbeat is a single Redis command (`ZADD`); pruning happens in `/api/live`, which the CDN caches for 15 s, so Redis traffic stays flat however many people are watching. Heartbeats stop while the tab is hidden.
 
 ## Privacy
 
 - Location comes from Vercel's request geo headers and is rounded to 0.5° (about 50 km).
 - The IP address is never read or stored.
 - The session id is random and lives only in `sessionStorage`.
-- Presence expires after 2 minutes, and the hourly replay counts expire after 26 hours.
+- Presence expires after 2 minutes, and the hourly replay counts expire after 26 hours. The faint "earlier" dots are those same hourly counts.
 - Responses group visitors by place and never include session ids.
 
 ## Credits
 
-Land shapes come from [Natural Earth](https://www.naturalearthdata.com/) (public domain), via [world-atlas](https://github.com/topojson/world-atlas). Rendering uses [three.js](https://threejs.org/).
+Land shapes and city lights come from [Natural Earth](https://www.naturalearthdata.com/) (public domain): 1:50m land via [world-atlas](https://github.com/topojson/world-atlas), and 1:10m populated places. Surface colours, heights and the water mask come from NASA's Blue Marble and topography images (public domain), using the copies in the [three-globe](https://github.com/vasturiano/three-globe) examples. Rendering uses [three.js](https://threejs.org/).
